@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+.env
+data/
+runs/
+unsloth_compiled_cache/
+*.pdf
