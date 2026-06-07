@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
+from typing import Any
 
 import torch
 from datasets import load_dataset
@@ -91,32 +93,43 @@ for row in dataset["train"].select(range(min(10, len(dataset["train"])))):
     roles = [message["role"] for message in row["messages"]]
     assert roles == ["system", "user", "assistant"], roles
 
-sampled_rows = []
-for split in ("train", "validation", "test"):
-    sampled_rows.extend(dataset[split].select(range(min(200, len(dataset[split])))))
-
-evidence_blob = json.dumps(
-    [
-        {
-            "input_features": row.get("input_features"),
-            "signals": row.get("signals"),
-            "stats": row.get("stats"),
-        }
-        for row in sampled_rows
-    ],
-    ensure_ascii=False,
-).lower()
-banned_evidence_terms = (
-    "rdap",
-    "whois",
-    "registered_domain",
-    "domain_age",
-    "domain registration",
-    "domain reputation",
+BANNED_FIELD_FRAGMENTS = (
+    "rdap", "whois", "registered_domain", "domain_age",
+    "domain_registration", "domain_reputation", "registrar", "registrant",
+    "creation_date", "expiration_date",
 )
-found_terms = [term for term in banned_evidence_terms if term in evidence_blob]
-if found_terms:
-    raise RuntimeError(f"Banned evidence terms found in dataset evidence fields: {found_terms}")
+EXPECTED_SIGNAL_FIELDS = {"url", "content"}
+EXPECTED_STATS_FIELDS = {
+    "text_chars", "links_or_form_targets", "script_link_iframe_resources",
+    "forms", "password_fields", "input_fields", "iframes", "scripts",
+    "status_code", "redirect_count",
+}
+
+
+def find_banned_field_paths(value: Any, path: str = "") -> list[str]:
+    matches: list[str] = []
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            normalized_key = re.sub(r"[^a-z0-9]+", "_", str(key).lower()).strip("_")
+            field_path = f"{path}.{key}" if path else str(key)
+            if any(fragment in normalized_key for fragment in BANNED_FIELD_FRAGMENTS):
+                matches.append(field_path)
+            matches.extend(find_banned_field_paths(nested, field_path))
+    elif isinstance(value, list):
+        for index, nested in enumerate(value):
+            matches.extend(find_banned_field_paths(nested, f"{path}[{index}]"))
+    return matches
+
+
+for split in ("train", "validation", "test"):
+    for row in dataset[split].select(range(min(200, len(dataset[split])))):
+        if set(row["signals"]) != EXPECTED_SIGNAL_FIELDS:
+            raise RuntimeError(f"Unexpected signal fields in {split}: {sorted(row['signals'])}")
+        if set(row["stats"]) != EXPECTED_STATS_FIELDS:
+            raise RuntimeError(f"Unexpected stats fields in {split}: {sorted(row['stats'])}")
+        banned_paths = find_banned_field_paths(row)
+        if banned_paths:
+            raise RuntimeError(f"Banned metadata fields found in {split}: {banned_paths}")
 
 dataset
 

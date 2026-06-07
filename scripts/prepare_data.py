@@ -183,8 +183,12 @@ def iter_content_collection(col: Collection, sample_size: int = 0) -> Iterable[d
         "title": 1,
         "html": 1,
         "error": 1,
-        "metadata": 1,
         "fetched_at": 1,
+        "metadata.url": 1,
+        "metadata.final_url": 1,
+        "metadata.status_code": 1,
+        "metadata.redirect_count": 1,
+        "metadata.error": 1,
     }
     query = {"html": {"$type": "string"}}
     if sample_size > 0:

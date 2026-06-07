@@ -98,10 +98,17 @@ SOCIAL_ENGINEERING_TERMS = {
     "credit card", "limited time", "login", "password", "payment failed",
     "security alert", "sign in", "unusual activity", "verify", "wallet",
 }
-BANNED_EVIDENCE_TERMS = (
+BANNED_FIELD_FRAGMENTS = (
     "rdap", "whois", "registered_domain", "domain_age",
-    "domain registration", "domain reputation",
+    "domain_registration", "domain_reputation", "registrar", "registrant",
+    "creation_date", "expiration_date",
 )
+EXPECTED_SIGNAL_FIELDS = {"url", "content"}
+EXPECTED_STATS_FIELDS = {
+    "text_chars", "links_or_form_targets", "script_link_iframe_resources",
+    "forms", "password_fields", "input_fields", "iframes", "scripts",
+    "status_code", "redirect_count",
+}
 
 
 def stable_id(value: str) -> str:
@@ -316,7 +323,12 @@ def metadata_status_ok(doc: dict[str, Any]) -> bool:
 def iter_documents(collection: Collection, limit: int) -> Iterable[dict[str, Any]]:
     projection = {
         "_id": 0, "url": 1, "title": 1, "html": 1,
-        "error": 1, "metadata": 1, "fetched_at": 1,
+        "error": 1, "fetched_at": 1,
+        "metadata.url": 1,
+        "metadata.final_url": 1,
+        "metadata.status_code": 1,
+        "metadata.redirect_count": 1,
+        "metadata.error": 1,
     }
     query = {"html": {"$type": "string"}}
     if SAMPLING == "random":
@@ -407,6 +419,23 @@ def split_examples(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]
 
 
 rows_by_split = split_examples(examples)
+
+
+def find_banned_field_paths(value: Any, path: str = "") -> list[str]:
+    matches: list[str] = []
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            normalized_key = re.sub(r"[^a-z0-9]+", "_", str(key).lower()).strip("_")
+            field_path = f"{path}.{key}" if path else str(key)
+            if any(fragment in normalized_key for fragment in BANNED_FIELD_FRAGMENTS):
+                matches.append(field_path)
+            matches.extend(find_banned_field_paths(nested, field_path))
+    elif isinstance(value, list):
+        for index, nested in enumerate(value):
+            matches.extend(find_banned_field_paths(nested, f"{path}[{index}]"))
+    return matches
+
+
 for split, rows in rows_by_split.items():
     if not rows:
         raise RuntimeError(f"{split} split is empty.")
@@ -414,22 +443,13 @@ for split, rows in rows_by_split.items():
         assert [message["role"] for message in row["messages"]] == [
             "system", "user", "assistant"
         ]
-
-evidence_blob = json.dumps(
-    [
-        {
-            "input_features": row["input_features"],
-            "signals": row["signals"],
-            "stats": row["stats"],
-        }
-        for rows in rows_by_split.values()
-        for row in rows[:500]
-    ],
-    ensure_ascii=False,
-).lower()
-found_terms = [term for term in BANNED_EVIDENCE_TERMS if term in evidence_blob]
-if found_terms:
-    raise RuntimeError(f"Banned evidence terms found: {found_terms}")
+        if set(row["signals"]) != EXPECTED_SIGNAL_FIELDS:
+            raise RuntimeError(f"Unexpected signal fields in {split}: {sorted(row['signals'])}")
+        if set(row["stats"]) != EXPECTED_STATS_FIELDS:
+            raise RuntimeError(f"Unexpected stats fields in {split}: {sorted(row['stats'])}")
+        banned_paths = find_banned_field_paths(row)
+        if banned_paths:
+            raise RuntimeError(f"Banned metadata fields found in {split}: {banned_paths}")
 
 dataset = DatasetDict(
     {split: Dataset.from_list(rows) for split, rows in rows_by_split.items()}
