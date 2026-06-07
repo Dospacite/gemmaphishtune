@@ -1,17 +1,16 @@
 # Gemma 4 E4B Unsloth training notebook for explainable phishing classification.
 # Target hardware: a single CUDA GPU with at least 80 GB VRAM.
 # Data policy: no RDAP, WHOIS, domain registration, domain reputation, or human-in-the-loop labels/examples.
+# Required .env values: HF_TOKEN. Optional: HF_DATASET_REPO_ID and HF_DATASET_REVISION.
 
 # %%!
-%pip install --upgrade --force-reinstall --no-cache-dir unsloth unsloth_zoo
-%pip install --upgrade datasets trl accelerate bitsandbytes huggingface-hub python-dotenv tqdm ipywidgets
+%pip install -q -U unsloth unsloth_zoo datasets trl accelerate bitsandbytes huggingface-hub python-dotenv tqdm ipywidgets
 
 # %%!
 from __future__ import annotations
 
 import json
 import os
-import sys
 from pathlib import Path
 
 import torch
@@ -19,23 +18,36 @@ from datasets import load_dataset
 from dotenv import load_dotenv
 from huggingface_hub import HfApi
 
-PROJECT_ROOT = Path.cwd()
-if PROJECT_ROOT.name == "notebooks":
-    PROJECT_ROOT = PROJECT_ROOT.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+IS_COLAB = "google.colab" in __import__("sys").modules
+ENV_FILE = Path("/content/.env" if IS_COLAB else ".env")
+if not ENV_FILE.exists() and IS_COLAB:
+    from google.colab import files
 
-load_dotenv(PROJECT_ROOT / ".env")
+    print("Upload the project's .env file.")
+    uploaded = files.upload()
+    if ".env" not in uploaded:
+        raise RuntimeError("The uploaded file must be named .env.")
+    ENV_FILE.write_bytes(uploaded[".env"])
+if not ENV_FILE.exists():
+    raise FileNotFoundError(f"Required environment file was not found: {ENV_FILE.resolve()}")
+load_dotenv(ENV_FILE, override=True)
+
 os.environ.setdefault("WANDB_DISABLED", "true")
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 MODEL_ID = "google/gemma-4-E4B-it"
-OUTPUT_DIR = PROJECT_ROOT / "runs" / "gemma4-e4b-unsloth-phishing"
+OUTPUT_DIR = Path(
+    "/content/gemma4-e4b-unsloth-phishing"
+    if IS_COLAB
+    else "runs/gemma4-e4b-unsloth-phishing"
+)
 
 HF_TOKEN = os.environ.get("HF_TOKEN") or None
 HF_DATASET_REPO_ID = os.environ.get("HF_DATASET_REPO_ID")
 HF_DATASET_REVISION = os.environ.get("HF_DATASET_REVISION") or None
+if not HF_TOKEN:
+    raise RuntimeError(f"HF_TOKEN is required in {ENV_FILE}.")
 
 MIN_VRAM_GB = 80
 ENFORCE_80GB_GPU = True
@@ -54,16 +66,13 @@ LORA_DROPOUT = 0.0
 SEED = 3407
 DATASET_NUM_PROC = 4
 
-print(f"Project root: {PROJECT_ROOT}")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+print(f"Environment file: {ENV_FILE.resolve()}")
+print(f"Output directory: {OUTPUT_DIR.resolve()}")
 print(f"Model: {MODEL_ID}")
 
 # %%!
 if not HF_DATASET_REPO_ID:
-    if not HF_TOKEN:
-        raise RuntimeError(
-            "Set HF_DATASET_REPO_ID in .env, or set HF_TOKEN so the notebook can infer "
-            "HF_DATASET_REPO_ID as <your-username>/gemma4-phishing-xai."
-        )
     HF_DATASET_REPO_ID = f"{HfApi(token=HF_TOKEN).whoami(token=HF_TOKEN)['name']}/gemma4-phishing-xai"
 
 print(f"Loading dataset from: https://huggingface.co/datasets/{HF_DATASET_REPO_ID}")
@@ -126,10 +135,11 @@ if ENFORCE_80GB_GPU and vram_gb < MIN_VRAM_GB:
     )
 
 # %%!
-from unsloth import FastLanguageModel
+from unsloth import FastModel
+from unsloth.chat_templates import train_on_responses_only
 from trl import SFTConfig, SFTTrainer
 
-model, tokenizer = FastLanguageModel.from_pretrained(
+model, tokenizer = FastModel.from_pretrained(
     model_name=MODEL_ID,
     max_seq_length=MAX_SEQ_LENGTH,
     load_in_4bit=False,
@@ -142,18 +152,13 @@ if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "right"
 
-model = FastLanguageModel.get_peft_model(
+model = FastModel.get_peft_model(
     model,
     r=LORA_R,
-    target_modules=[
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "o_proj",
-        "gate_proj",
-        "up_proj",
-        "down_proj",
-    ],
+    finetune_vision_layers=False,
+    finetune_language_layers=True,
+    finetune_attention_modules=True,
+    finetune_mlp_modules=True,
     lora_alpha=LORA_ALPHA,
     lora_dropout=LORA_DROPOUT,
     bias="none",
@@ -204,7 +209,6 @@ training_args = SFTConfig(
     fp16=False,
     tf32=True,
     packing=False,
-    assistant_only_loss=True,
     dataset_num_proc=DATASET_NUM_PROC,
     dataloader_num_workers=2,
     seed=SEED,
@@ -217,6 +221,12 @@ trainer = SFTTrainer(
     train_dataset=dataset["train"],
     eval_dataset=dataset["validation"],
     args=training_args,
+)
+trainer = train_on_responses_only(
+    trainer,
+    instruction_part="<|turn>user\n",
+    response_part="<|turn>model\n",
+    tokenizer=tokenizer,
 )
 
 trainer
@@ -254,7 +264,7 @@ with (OUTPUT_DIR / "notebook_config.json").open("w", encoding="utf-8") as fh:
             "warmup_steps": WARMUP_STEPS,
             "load_in_4bit": False,
             "load_in_16bit": True,
-            "assistant_only_loss": True,
+            "response_only_loss": True,
             "hf_dataset_repo_id": HF_DATASET_REPO_ID,
             "hf_dataset_revision": HF_DATASET_REVISION,
         },
@@ -265,7 +275,7 @@ with (OUTPUT_DIR / "notebook_config.json").open("w", encoding="utf-8") as fh:
 print(f"Saved adapter and tokenizer to {ADAPTER_DIR}")
 
 # %%!
-FastLanguageModel.for_inference(model)
+FastModel.for_inference(model)
 
 sample = dataset["test"][0]
 prompt_messages = sample["messages"][:-1]
