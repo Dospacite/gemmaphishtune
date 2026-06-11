@@ -35,6 +35,10 @@ if not ENV_FILE.exists():
 load_dotenv(ENV_FILE, override=True)
 
 os.environ.setdefault("WANDB_DISABLED", "true")
+os.environ.setdefault("UNSLOTH_DISABLE_STATISTICS", "1")
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "600")
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "60")
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
@@ -56,8 +60,9 @@ ENFORCE_80GB_GPU = True
 
 MAX_SEQ_LENGTH = 4096
 
-PER_DEVICE_TRAIN_BATCH_SIZE = 8
-GRADIENT_ACCUMULATION_STEPS = 2
+PER_DEVICE_TRAIN_BATCH_SIZE = 16
+PER_DEVICE_EVAL_BATCH_SIZE = 8
+GRADIENT_ACCUMULATION_STEPS = 1
 NUM_TRAIN_EPOCHS = 1
 MAX_STEPS = -1
 LEARNING_RATE = 2e-4
@@ -159,6 +164,7 @@ model, tokenizer = FastModel.from_pretrained(
     load_in_16bit=True,
     full_finetuning=False,
     token=HF_TOKEN,
+    disable_log_stats=True,
 )
 
 if tokenizer.pad_token is None:
@@ -201,19 +207,44 @@ except TypeError:
 print(preview[:2000])
 
 # %%!
+def format_conversations(examples: dict[str, Any]) -> list[str]:
+    conversations = examples["messages"]
+    if not conversations:
+        return []
+    if isinstance(conversations[0], dict):
+        conversations = [conversations]
+
+    rendered: list[str] = []
+    for messages in conversations:
+        try:
+            text = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=False,
+                enable_thinking=False,
+            )
+        except TypeError:
+            text = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+        rendered.append(text)
+    return rendered
+
+
 training_args = SFTConfig(
     output_dir=str(OUTPUT_DIR),
     max_length=MAX_SEQ_LENGTH,
     per_device_train_batch_size=PER_DEVICE_TRAIN_BATCH_SIZE,
-    per_device_eval_batch_size=PER_DEVICE_TRAIN_BATCH_SIZE,
+    per_device_eval_batch_size=PER_DEVICE_EVAL_BATCH_SIZE,
     gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
     learning_rate=LEARNING_RATE,
     warmup_steps=WARMUP_STEPS,
     num_train_epochs=NUM_TRAIN_EPOCHS,
     max_steps=MAX_STEPS,
     logging_steps=5,
-    eval_strategy="steps",
-    eval_steps=50,
+    eval_strategy="no",
     save_strategy="steps",
     save_steps=100,
     save_total_limit=3,
@@ -225,6 +256,7 @@ training_args = SFTConfig(
     dataset_num_proc=DATASET_NUM_PROC,
     dataloader_num_workers=2,
     seed=SEED,
+    disable_tqdm=True,
     report_to="none",
 )
 
@@ -234,7 +266,15 @@ trainer = SFTTrainer(
     train_dataset=dataset["train"],
     eval_dataset=dataset["validation"],
     args=training_args,
+    formatting_func=format_conversations,
 )
+try:
+    from transformers.utils.notebook import NotebookProgressCallback
+
+    trainer.remove_callback(NotebookProgressCallback)
+except Exception:
+    pass
+
 trainer = train_on_responses_only(
     trainer,
     instruction_part="<|turn>user\n",
@@ -271,6 +311,7 @@ with (OUTPUT_DIR / "notebook_config.json").open("w", encoding="utf-8") as fh:
             "model_id": MODEL_ID,
             "max_seq_length": MAX_SEQ_LENGTH,
             "per_device_train_batch_size": PER_DEVICE_TRAIN_BATCH_SIZE,
+            "per_device_eval_batch_size": PER_DEVICE_EVAL_BATCH_SIZE,
             "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
             "lora_r": LORA_R,
             "lora_alpha": LORA_ALPHA,
@@ -306,7 +347,13 @@ except TypeError:
         add_generation_prompt=True,
     )
 
-inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=MAX_SEQ_LENGTH).to(model.device)
+input_device = next(model.parameters()).device
+inputs = tokenizer(
+    text=prompt,
+    return_tensors="pt",
+    truncation=True,
+    max_length=MAX_SEQ_LENGTH,
+).to(input_device)
 with torch.no_grad():
     output_ids = model.generate(
         **inputs,
