@@ -71,7 +71,8 @@ EVAL_SPLIT = os.environ.get("EVAL_SPLIT", "test")
 MAX_EVAL_SAMPLES = int(os.environ.get("MAX_EVAL_SAMPLES", "0")) or None
 MAX_SEQ_LENGTH = int(os.environ.get("MAX_SEQ_LENGTH", "4096"))
 MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "256"))
-GENERATION_BATCH_SIZE = int(os.environ.get("GENERATION_BATCH_SIZE", "4"))
+GENERATION_BATCH_SIZE = int(os.environ.get("GENERATION_BATCH_SIZE", "64"))
+MIN_GENERATION_BATCH_SIZE = int(os.environ.get("MIN_GENERATION_BATCH_SIZE", "1"))
 MIN_VRAM_GB = float(os.environ.get("MIN_VRAM_GB", "80"))
 ENFORCE_MIN_VRAM = os.environ.get("ENFORCE_MIN_VRAM", "true").lower() not in {"0", "false", "no"}
 EVAL_DIR = Path("/content/gemma4-e4b-eval" if IS_COLAB else "gemma4-e4b-eval")
@@ -248,16 +249,11 @@ def parse_prediction(text: str) -> dict[str, Any]:
     }
 
 
-def batched(rows: list[dict[str, Any]], batch_size: int):
-    for start in range(0, len(rows), batch_size):
-        yield start, rows[start : start + batch_size]
+def is_cuda_oom(error: BaseException) -> bool:
+    return "out of memory" in str(error).lower() or "cuda oom" in str(error).lower()
 
-# %%!
-rows = [dict(row) for row in eval_dataset]
-predictions: list[dict[str, Any]] = []
-start_time = time.time()
 
-for start, batch_rows in tqdm(list(batched(rows, GENERATION_BATCH_SIZE)), desc="Generating"):
+def generate_batch(batch_rows: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
     prompts = [make_prompt(row) for row in batch_rows]
     inputs = processor(
         text=prompts,
@@ -277,6 +273,34 @@ for start, batch_rows in tqdm(list(batched(rows, GENERATION_BATCH_SIZE)), desc="
         )
     generated_ids = output_ids[:, prompt_token_count:]
     decoded = text_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+    return prompts, decoded
+
+# %%!
+rows = [dict(row) for row in eval_dataset]
+predictions: list[dict[str, Any]] = []
+start_time = time.time()
+current_batch_size = max(MIN_GENERATION_BATCH_SIZE, GENERATION_BATCH_SIZE)
+max_successful_batch_size = 0
+peak_allocated_gb = None
+peak_reserved_gb = None
+
+progress = tqdm(total=len(rows), desc=f"Generating (batch={current_batch_size})")
+start = 0
+while start < len(rows):
+    batch_size = min(current_batch_size, len(rows) - start)
+    batch_rows = rows[start : start + batch_size]
+    try:
+        prompts, decoded = generate_batch(batch_rows)
+    except RuntimeError as error:
+        if is_cuda_oom(error) and batch_size > MIN_GENERATION_BATCH_SIZE:
+            torch.cuda.empty_cache()
+            current_batch_size = max(MIN_GENERATION_BATCH_SIZE, batch_size // 2)
+            progress.set_description(f"Generating (batch={current_batch_size})")
+            print(f"CUDA OOM at batch {batch_size}; retrying with batch {current_batch_size}.")
+            continue
+        raise
+    max_successful_batch_size = max(max_successful_batch_size, batch_size)
+    progress.update(batch_size)
 
     for offset, (row, prompt, prediction_text) in enumerate(zip(batch_rows, prompts, decoded)):
         parsed = parse_prediction(prediction_text)
@@ -309,6 +333,14 @@ for start, batch_rows in tqdm(list(batched(rows, GENERATION_BATCH_SIZE)), desc="
             "redirect_count": stats.get("redirect_count"),
         }
         predictions.append(result)
+    start += batch_size
+
+progress.close()
+if torch.cuda.is_available():
+    peak_allocated_gb = torch.cuda.max_memory_allocated() / 1024**3
+    peak_reserved_gb = torch.cuda.max_memory_reserved() / 1024**3
+    print(f"Max successful generation batch size: {max_successful_batch_size}")
+    print(f"Peak CUDA allocated: {peak_allocated_gb:.2f} GB | reserved: {peak_reserved_gb:.2f} GB")
 
 elapsed_seconds = time.time() - start_time
 df = pd.DataFrame(predictions)
@@ -355,6 +387,10 @@ metrics = {
     "macro_f1": float(f1.mean()),
     "elapsed_seconds": round(elapsed_seconds, 2),
     "seconds_per_example": round(elapsed_seconds / max(1, len(df)), 4),
+    "requested_generation_batch_size": int(GENERATION_BATCH_SIZE),
+    "max_successful_generation_batch_size": int(max_successful_batch_size),
+    "peak_cuda_allocated_gb": round(peak_allocated_gb, 3) if peak_allocated_gb is not None else None,
+    "peak_cuda_reserved_gb": round(peak_reserved_gb, 3) if peak_reserved_gb is not None else None,
 }
 print(json.dumps(metrics, indent=2))
 print(classification_report(y_true, y_pred, labels=LABELS, zero_division=0))
